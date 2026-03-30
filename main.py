@@ -1,8 +1,8 @@
 import os
-import re
+import tempfile
 import logging
 from flask import Flask, request, jsonify
-import instaloader
+import yt_dlp
 
 logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -12,46 +12,43 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Initialize Instaloader (no login for public posts)
-L = instaloader.Instaloader(
-    download_pictures=False,
-    download_videos=False,
-    download_video_thumbnails=False,
-    download_geotags=False,
-    download_comments=False,
-    save_metadata=False,
-    compress_json=False,
-    quiet=True
-)
-
-# Optional: Login with Instagram account for better reliability
-# (Set env vars INSTAGRAM_USER and INSTAGRAM_PASS on Render)
-INSTA_USER = os.getenv("INSTAGRAM_USER", "")
-INSTA_PASS = os.getenv("INSTAGRAM_PASS", "")
-
-if INSTA_USER and INSTA_PASS:
-    try:
-        L.login(INSTA_USER, INSTA_PASS)
-        logger.info(f"Logged in as: {INSTA_USER}")
-    except Exception as e:
-        logger.warning(f"Login failed, using guest mode: {e}")
+# ============================================================
+# Instagram Cookies — Render Environment Variables se aate hain
+# ============================================================
+INSTAGRAM_SESSIONID  = os.getenv("INSTAGRAM_SESSIONID", "")
+INSTAGRAM_CSRFTOKEN  = os.getenv("INSTAGRAM_CSRFTOKEN", "")
+INSTAGRAM_DS_USER_ID = os.getenv("INSTAGRAM_DS_USER_ID", "")
 
 
-def extract_shortcode(url_or_code):
-    """Extract shortcode from Instagram URL or return as-is"""
-    # Match /p/SHORTCODE or /reel/SHORTCODE or /reels/SHORTCODE
-    match = re.search(r'/(?:p|reel|reels)/([A-Za-z0-9_-]+)', url_or_code)
-    if match:
-        return match.group(1)
-    # If no URL pattern, assume it's already a shortcode
-    if re.match(r'^[A-Za-z0-9_-]+$', url_or_code):
-        return url_or_code
-    return None
+def create_cookie_file():
+    """Netscape format cookie file create karo yt-dlp ke liye"""
+    if not INSTAGRAM_SESSIONID:
+        logger.warning("⚠️ INSTAGRAM_SESSIONID env var missing!")
+        return None
+
+    # URL-encoded characters decode karo
+    sessionid = INSTAGRAM_SESSIONID.replace('%3A', ':')
+
+    cookie_content = (
+        "# Netscape HTTP Cookie File\n"
+        f".instagram.com\tTRUE\t/\tTRUE\t2099999999\tds_user_id\t{INSTAGRAM_DS_USER_ID}\n"
+        f".instagram.com\tTRUE\t/\tTRUE\t2099999999\tcsrftoken\t{INSTAGRAM_CSRFTOKEN}\n"
+        f".instagram.com\tTRUE\t/\tTRUE\t2099999999\tsessionid\t{sessionid}\n"
+    )
+
+    tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
+    tmp.write(cookie_content)
+    tmp.close()
+    logger.info(f"✅ Cookie file ready: {tmp.name}")
+    return tmp.name
 
 
+# ============================================================
+# Flask Routes
+# ============================================================
 @app.route('/')
 def home():
-    return "📸 Instagram Downloader API is running!"
+    return "📸 Instagram Downloader (yt-dlp + cookies) is running!"
 
 
 @app.route('/health')
@@ -63,79 +60,81 @@ def health():
 def get_instagram_data():
     """
     GET /instagram?url=https://www.instagram.com/p/SHORTCODE/
-    OR
-    GET /instagram?url=SHORTCODE
-    
-    Returns JSON with image URLs and caption
+    Returns all images/videos from the post (carousel support included!)
     """
     url_input = request.args.get('url', '').strip()
 
     if not url_input:
         return jsonify({"success": False, "error": "url parameter required"}), 400
 
-    shortcode = extract_shortcode(url_input)
-    if not shortcode:
-        return jsonify({"success": False, "error": f"Invalid URL or shortcode: {url_input}"}), 400
+    logger.info(f"📥 Fetching: {url_input}")
+    cookie_file = create_cookie_file()
 
-    logger.info(f"Fetching Instagram post: {shortcode}")
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'skip_download': True,
+        'extract_flat': False,
+    }
+
+    if cookie_file:
+        ydl_opts['cookiefile'] = cookie_file
 
     try:
-        post = instaloader.Post.from_shortcode(L.context, shortcode)
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url_input, download=False)
 
         media_urls = []
+        caption = info.get('description', '') or info.get('title', '') or ''
 
-        if post.typename == 'GraphSidecar':
-            # Carousel - multiple images/videos
-            for node in post.get_sidecar_nodes():
-                if node.is_video:
+        if 'entries' in info and info['entries']:
+            # ✅ Carousel — multiple images/videos
+            for entry in info['entries']:
+                if not entry:
+                    continue
+                url = entry.get('url', '')
+                ext = entry.get('ext', '')
+                if url:
                     media_urls.append({
-                        "type": "video",
-                        "url": node.video_url,
-                        "thumbnail": node.display_url
+                        'type': 'video' if ext in ['mp4', 'webm', 'mov'] else 'image',
+                        'url': url
                     })
-                else:
-                    media_urls.append({
-                        "type": "image",
-                        "url": node.display_url
-                    })
-        elif post.is_video:
-            media_urls.append({
-                "type": "video",
-                "url": post.video_url,
-                "thumbnail": post.url
-            })
         else:
-            media_urls.append({
-                "type": "image",
-                "url": post.url
-            })
+            # ✅ Single image or video
+            url = info.get('url', '')
+            ext = info.get('ext', '')
+            if url:
+                media_urls.append({
+                    'type': 'video' if ext in ['mp4', 'webm', 'mov'] else 'image',
+                    'url': url
+                })
 
-        result = {
+        if not media_urls:
+            return jsonify({"success": False, "error": "Koi media nahi mila!"}), 404
+
+        logger.info(f"✅ {len(media_urls)} media items found")
+
+        return jsonify({
             "success": True,
-            "shortcode": shortcode,
-            "caption": post.caption or "",
-            "post_type": "reel" if post.is_video else ("carousel" if post.typename == 'GraphSidecar' else "post"),
-            "owner_username": post.owner_username,
-            "owner_fullname": post.owner_profile.full_name if post.owner_profile else "",
+            "caption": caption,
             "media_count": len(media_urls),
             "media_urls": media_urls,
-            # First image URL directly (for easy access in n8n)
-            "first_image_url": media_urls[0]["url"] if media_urls else "",
-            "first_thumbnail_url": media_urls[0].get("thumbnail", media_urls[0]["url"]) if media_urls else ""
-        }
+            "first_image_url": media_urls[0]['url']
+        })
 
-        logger.info(f"Success: {shortcode} — {len(media_urls)} media items")
-        return jsonify(result)
-
-    except instaloader.exceptions.InstaloaderException as e:
-        logger.error(f"Instaloader error for {shortcode}: {e}")
-        return jsonify({"success": False, "error": f"Instagram fetch failed: {str(e)}"}), 500
     except Exception as e:
-        logger.error(f"Unexpected error for {shortcode}: {e}")
+        logger.error(f"❌ Error: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
+
+    finally:
+        if cookie_file:
+            try:
+                os.unlink(cookie_file)
+            except Exception:
+                pass
 
 
 if __name__ == '__main__':
     port = int(os.getenv("PORT", 10000))
-    logger.info(f"Starting on port {port}")
+    logger.info(f"🚀 Starting on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
