@@ -3,3 +3,4 @@ yt-dlp
 gunicorn==21.2.0
 requests==2.32.3
 instagrapi==2.1.2
+Pillow>=9.0.0
