@@ -36,8 +36,23 @@ RENDER_API_KEY       = os.getenv("RENDER_API_KEY", "")
 RENDER_SERVICE_ID    = os.getenv("RENDER_SERVICE_ID", "")
 COOKIE_UPDATE_SECRET = os.getenv("COOKIE_UPDATE_SECRET", "")
 
+# Comma-separated chat IDs allowed to run /updatecookie command.
+TELEGRAM_ADMIN_CHAT_IDS = {
+    chat_id.strip()
+    for chat_id in os.getenv("TELEGRAM_ADMIN_CHAT_ID", "").split(",")
+    if chat_id.strip()
+}
+
+PENDING_COOKIE_UPDATE_CHATS = set()
+
 # Instagram Base64 encoding table (same as yt-dlp source)
 _ENCODING_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
+
+REQUIRED_COOKIE_ENV_KEYS = (
+    "INSTAGRAM_SESSIONID",
+    "INSTAGRAM_CSRFTOKEN",
+    "INSTAGRAM_DS_USER_ID",
+)
 
 
 # ============================================================
@@ -281,17 +296,206 @@ def fetch_via_ytdlp(url_input):
 
 
 # ============================================================
+# Cookie Update Helpers (Render + Telegram)
+# ============================================================
+def extract_cookie_env_values(cookies_raw):
+    """Cookie JSON array se required 3 env values nikaalo."""
+    if not isinstance(cookies_raw, list):
+        return None, "JSON array expected"
+
+    extracted = {}
+    for item in cookies_raw:
+        if not isinstance(item, dict):
+            continue
+
+        name = str(item.get("name", ""))
+        value = str(item.get("value", ""))
+        if not value:
+            continue
+
+        if name == "sessionid":
+            extracted["INSTAGRAM_SESSIONID"] = value
+        elif name == "csrftoken":
+            extracted["INSTAGRAM_CSRFTOKEN"] = value
+        elif name == "ds_user_id":
+            extracted["INSTAGRAM_DS_USER_ID"] = value
+
+    missing = [key for key in REQUIRED_COOKIE_ENV_KEYS if key not in extracted]
+    if missing:
+        return None, f"Ye cookies JSON mein nahi mili: {missing}"
+
+    return extracted, None
+
+
+def update_render_cookie_env(cookies_raw):
+    """Render env vars update karke service redeploy trigger karo."""
+    if not RENDER_API_KEY or not RENDER_SERVICE_ID:
+        return {
+            "success": False,
+            "error": "RENDER_API_KEY ya RENDER_SERVICE_ID env mein missing hai"
+        }, 500
+
+    extracted, error = extract_cookie_env_values(cookies_raw)
+    if error:
+        return {"success": False, "error": error}, 400
+
+    logger.info(f"🍪 Cookies extracted: {list(extracted.keys())}")
+
+    render_headers = {
+        "Authorization": f"Bearer {RENDER_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    try:
+        env_resp = requests.get(
+            f"https://api.render.com/v1/services/{RENDER_SERVICE_ID}/env-vars",
+            headers=render_headers,
+            timeout=10
+        )
+    except Exception as e:
+        logger.error(f"❌ Render env fetch request failed: {e}")
+        return {"success": False, "error": f"Render env fetch request failed: {e}"}, 500
+
+    if not env_resp.ok:
+        logger.error(f"❌ Render env fetch failed: {env_resp.status_code} {env_resp.text}")
+        return {"success": False, "error": f"Render env fetch failed: {env_resp.status_code}"}, 500
+
+    try:
+        existing_env = env_resp.json()
+    except Exception:
+        return {"success": False, "error": "Render env response parse failed"}, 500
+
+    if not isinstance(existing_env, list):
+        return {"success": False, "error": "Unexpected Render env response format"}, 500
+
+    updated_keys = []
+    for item in existing_env:
+        key = item.get("key")
+        if key in extracted:
+            item["value"] = extracted[key]
+            updated_keys.append(key)
+
+    for key, value in extracted.items():
+        if key not in updated_keys:
+            existing_env.append({"key": key, "value": value})
+            updated_keys.append(key)
+
+    try:
+        put_resp = requests.put(
+            f"https://api.render.com/v1/services/{RENDER_SERVICE_ID}/env-vars",
+            headers=render_headers,
+            json=existing_env,
+            timeout=10
+        )
+    except Exception as e:
+        logger.error(f"❌ Render env update request failed: {e}")
+        return {"success": False, "error": f"Render env update request failed: {e}"}, 500
+
+    if not put_resp.ok:
+        logger.error(f"❌ Render env update failed: {put_resp.status_code} {put_resp.text}")
+        return {"success": False, "error": f"Render env update failed: {put_resp.status_code}"}, 500
+
+    logger.info(f"✅ Env vars updated: {updated_keys}")
+
+    try:
+        deploy_resp = requests.post(
+            f"https://api.render.com/v1/services/{RENDER_SERVICE_ID}/deploys",
+            headers=render_headers,
+            json={"clearCache": "do_not_clear"},
+            timeout=10
+        )
+    except Exception as e:
+        logger.error(f"❌ Deploy trigger request failed: {e}")
+        return {
+            "success": False,
+            "error": f"Env update ho gayi, lekin deploy request fail hua: {e}",
+            "updated_keys": updated_keys,
+            "deploy_triggered": False
+        }, 502
+
+    if not deploy_resp.ok:
+        logger.error(f"❌ Deploy trigger failed: {deploy_resp.status_code} {deploy_resp.text}")
+        return {
+            "success": False,
+            "error": f"Env update ho gayi, lekin deploy trigger fail hua: {deploy_resp.status_code}",
+            "updated_keys": updated_keys,
+            "deploy_triggered": False
+        }, 502
+
+    logger.info(f"🚀 Redeploy triggered | Status: {deploy_resp.status_code}")
+    return {
+        "success": True,
+        "message": "✅ Cookies update ho gayi! Service redeploying... ~1-2 min mein ready ho jayega.",
+        "updated_keys": updated_keys,
+        "deploy_triggered": True
+    }, 200
+
+
+def parse_cookie_json_payload(raw_text):
+    """Telegram text payload se JSON parse karo (code fences supported)."""
+    payload = (raw_text or "").strip()
+    if not payload:
+        raise ValueError("Cookie JSON empty hai")
+
+    if payload.startswith("```"):
+        payload = re.sub(r'^```(?:json)?\s*', '', payload, flags=re.IGNORECASE)
+        payload = re.sub(r'\s*```$', '', payload)
+
+    return json_module.loads(payload)
+
+
+def is_cookie_update_authorized(chat_id):
+    """Sirf allowlisted chat IDs ko cookie update allow karo."""
+    if not TELEGRAM_ADMIN_CHAT_IDS:
+        return False
+    return str(chat_id) in TELEGRAM_ADMIN_CHAT_IDS
+
+
+# ============================================================
 # Telegram Helper Functions
 # ============================================================
 def tg_send_message(chat_id, text, parse_mode="HTML"):
     try:
+        payload = {"chat_id": chat_id, "text": text}
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+
         requests.post(
             f"{TELEGRAM_API}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "parse_mode": parse_mode},
+            json=payload,
             timeout=10
         )
     except Exception as e:
         logger.error(f"❌ tg_send_message failed: {e}")
+
+
+def process_cookie_update_from_telegram(chat_id, raw_payload):
+    """Telegram command payload se cookies update + redeploy trigger karo."""
+    try:
+        cookies_raw = parse_cookie_json_payload(raw_payload)
+    except Exception as e:
+        tg_send_message(
+            chat_id,
+            f"❌ Invalid JSON: {e}\n\nDobara poora cookie JSON bhejo, ya /cancel likho.",
+            parse_mode=None
+        )
+        return False
+
+    result, status_code = update_render_cookie_env(cookies_raw)
+    if status_code == 200:
+        tg_send_message(
+            chat_id,
+            "✅ Cookies update ho gayi.\n🚀 Redeploy trigger ho gaya hai. 1-2 min baad bot fresh cookies par aa jayega.",
+            parse_mode=None
+        )
+        return True
+
+    tg_send_message(
+        chat_id,
+        f"❌ Cookie update failed ({status_code}): {result.get('error', 'Unknown error')}",
+        parse_mode=None
+    )
+    return False
 
 
 def tg_send_photo(chat_id, url, caption=""):
@@ -452,97 +656,16 @@ def update_cookies():
         logger.warning("❌ /update-cookies — unauthorized attempt")
         return jsonify({"success": False, "error": "Unauthorized"}), 401
 
-    # 2. Render config check
-    if not RENDER_API_KEY or not RENDER_SERVICE_ID:
-        return jsonify({"success": False, "error": "RENDER_API_KEY ya RENDER_SERVICE_ID env mein missing hai"}), 500
-
-    # 3. JSON parse
+    # 2. JSON parse
     try:
         cookies_raw = request.get_json(force=True)
         if isinstance(cookies_raw, str):
             cookies_raw = json_module.loads(cookies_raw)
-        if not isinstance(cookies_raw, list):
-            return jsonify({"success": False, "error": "JSON array expected"}), 400
     except Exception as e:
         return jsonify({"success": False, "error": f"Invalid JSON: {e}"}), 400
 
-    # 4. 3 zaroori cookies extract karo
-    extracted = {}
-    for c in cookies_raw:
-        name = c.get("name", "")
-        value = c.get("value", "")
-        if name == "sessionid" and value:
-            extracted["INSTAGRAM_SESSIONID"] = value
-        elif name == "csrftoken" and value:
-            extracted["INSTAGRAM_CSRFTOKEN"] = value
-        elif name == "ds_user_id" and value:
-            extracted["INSTAGRAM_DS_USER_ID"] = value
-
-    missing = [k for k in ["INSTAGRAM_SESSIONID", "INSTAGRAM_CSRFTOKEN", "INSTAGRAM_DS_USER_ID"] if k not in extracted]
-    if missing:
-        return jsonify({"success": False, "error": f"Ye cookies JSON mein nahi mili: {missing}"}), 400
-
-    logger.info(f"🍪 Cookies extracted: {list(extracted.keys())}")
-
-    render_headers = {
-        "Authorization": f"Bearer {RENDER_API_KEY}",
-        "Content-Type": "application/json"
-    }
-
-    # 5. Existing env vars fetch karo Render se
-    env_resp = requests.get(
-        f"https://api.render.com/v1/services/{RENDER_SERVICE_ID}/env-vars",
-        headers=render_headers,
-        timeout=10
-    )
-    if not env_resp.ok:
-        logger.error(f"❌ Render env fetch failed: {env_resp.status_code} {env_resp.text}")
-        return jsonify({"success": False, "error": f"Render env fetch failed: {env_resp.status_code}"}), 500
-
-    existing_env = env_resp.json()  # [{"key": "...", "value": "..."}, ...]
-
-    # 6. Sirf 3 Instagram cookie values update karo, baaki sab same rakho
-    updated_keys = []
-    for item in existing_env:
-        if item["key"] in extracted:
-            item["value"] = extracted[item["key"]]
-            updated_keys.append(item["key"])
-
-    # Agar koi key exist hi nahi karti toh add karo
-    for key, value in extracted.items():
-        if key not in updated_keys:
-            existing_env.append({"key": key, "value": value})
-            updated_keys.append(key)
-
-    # 7. PUT — full env vars list wapas bhejo
-    put_resp = requests.put(
-        f"https://api.render.com/v1/services/{RENDER_SERVICE_ID}/env-vars",
-        headers=render_headers,
-        json=existing_env,
-        timeout=10
-    )
-    if not put_resp.ok:
-        logger.error(f"❌ Render env update failed: {put_resp.status_code} {put_resp.text}")
-        return jsonify({"success": False, "error": f"Render env update failed: {put_resp.status_code}"}), 500
-
-    logger.info(f"✅ Env vars updated: {updated_keys}")
-
-    # 8. Redeploy trigger
-    deploy_resp = requests.post(
-        f"https://api.render.com/v1/services/{RENDER_SERVICE_ID}/deploys",
-        headers=render_headers,
-        json={"clearCache": "do_not_clear"},
-        timeout=10
-    )
-    deploy_ok = deploy_resp.ok
-    logger.info(f"🚀 Redeploy triggered: {deploy_ok} | Status: {deploy_resp.status_code}")
-
-    return jsonify({
-        "success": True,
-        "message": "✅ Cookies update ho gayi! Service redeploying... ~1-2 min mein ready ho jayega.",
-        "updated_keys": updated_keys,
-        "deploy_triggered": deploy_ok
-    })
+    result, status_code = update_render_cookie_env(cookies_raw)
+    return jsonify(result), status_code
 
 
 # ============================================================
@@ -570,6 +693,7 @@ def telegram_webhook():
         return jsonify({"ok": True}), 200
 
     logger.info(f"💬 Telegram message from {chat_id}: {text[:80]}")
+    chat_key = str(chat_id)
 
     if text.startswith('/start'):
         welcome = (
@@ -586,7 +710,60 @@ def telegram_webhook():
             "<code>https://www.instagram.com/reel/XXXXXXX/</code>\n\n"
             "⚠️ <b>Note:</b> Sirf public posts ka kaam karega."
         )
+
+        if is_cookie_update_authorized(chat_id):
+            welcome += (
+                "\n\n🔐 <b>Admin Command:</b>"
+                "\n<code>/updatecookie</code>"
+                "\n(Iske baad poora cookie JSON bhej do)"
+            )
+
         tg_send_message(chat_id, welcome)
+        return jsonify({"ok": True}), 200
+
+    if text.startswith('/cancel'):
+        if chat_key in PENDING_COOKIE_UPDATE_CHATS:
+            PENDING_COOKIE_UPDATE_CHATS.discard(chat_key)
+            tg_send_message(chat_id, "✅ Pending cookie update cancel ho gaya.", parse_mode=None)
+        else:
+            tg_send_message(chat_id, "ℹ️ Koi pending cookie update nahi hai.", parse_mode=None)
+        return jsonify({"ok": True}), 200
+
+    if text.startswith('/updatecookie') or text.startswith('/updatecookies'):
+        if not TELEGRAM_ADMIN_CHAT_IDS:
+            tg_send_message(
+                chat_id,
+                "❌ TELEGRAM_ADMIN_CHAT_ID env set nahi hai. Pehle Render env set karo.",
+                parse_mode=None
+            )
+            return jsonify({"ok": True}), 200
+
+        if not is_cookie_update_authorized(chat_id):
+            tg_send_message(chat_id, "❌ Unauthorized command.", parse_mode=None)
+            return jsonify({"ok": True}), 200
+
+        parts = text.split(maxsplit=1)
+        if len(parts) == 1:
+            PENDING_COOKIE_UPDATE_CHATS.add(chat_key)
+            tg_send_message(
+                chat_id,
+                "📥 Ab Cookie-Editor ka poora JSON array bhejo.\nTip: cancel ke liye /cancel likho.",
+                parse_mode=None
+            )
+            return jsonify({"ok": True}), 200
+
+        process_cookie_update_from_telegram(chat_id, parts[1])
+        return jsonify({"ok": True}), 200
+
+    if chat_key in PENDING_COOKIE_UPDATE_CHATS:
+        if not is_cookie_update_authorized(chat_id):
+            PENDING_COOKIE_UPDATE_CHATS.discard(chat_key)
+            tg_send_message(chat_id, "❌ Unauthorized command.", parse_mode=None)
+            return jsonify({"ok": True}), 200
+
+        is_ok = process_cookie_update_from_telegram(chat_id, text)
+        if is_ok:
+            PENDING_COOKIE_UPDATE_CHATS.discard(chat_key)
         return jsonify({"ok": True}), 200
 
     if 'instagram.com' in text:
