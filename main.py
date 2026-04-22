@@ -368,8 +368,16 @@ def update_render_cookie_env(cookies_raw):
     if not isinstance(existing_env, list):
         return {"success": False, "error": "Unexpected Render env response format"}, 500
 
-    updated_keys = []
+    # Render GET API format is [{"envVar": {"key": "K", "value": "V"}}], we need to map it to [{"key": "K", "value": "V"}]
+    clean_env = []
     for item in existing_env:
+        if "envVar" in item:
+            clean_env.append({"key": item["envVar"]["key"], "value": item["envVar"]["value"]})
+        elif "key" in item:
+            clean_env.append({"key": item["key"], "value": item.get("value", "")})
+
+    updated_keys = []
+    for item in clean_env:
         key = item.get("key")
         if key in extracted:
             item["value"] = extracted[key]
@@ -377,14 +385,14 @@ def update_render_cookie_env(cookies_raw):
 
     for key, value in extracted.items():
         if key not in updated_keys:
-            existing_env.append({"key": key, "value": value})
+            clean_env.append({"key": key, "value": value})
             updated_keys.append(key)
 
     try:
         put_resp = requests.put(
             f"https://api.render.com/v1/services/{RENDER_SERVICE_ID}/env-vars",
             headers=render_headers,
-            json=existing_env,
+            json=clean_env,
             timeout=10
         )
     except Exception as e:
