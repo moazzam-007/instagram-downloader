@@ -2,6 +2,7 @@ import os
 import re
 import tempfile
 import logging
+import threading
 import requests
 from urllib.parse import urlparse
 from flask import Flask, request, jsonify
@@ -16,169 +17,186 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # ============================================================
-# Instagram Cookies — Render Environment Variables se aate hain
+# Instagram Credentials — Render Environment Variables
+# Sirf ek baar set karo, cookies kabhi manually nahi badlni!
 # ============================================================
-INSTAGRAM_SESSIONID  = os.getenv("INSTAGRAM_SESSIONID", "")
-INSTAGRAM_CSRFTOKEN  = os.getenv("INSTAGRAM_CSRFTOKEN", "")
-INSTAGRAM_DS_USER_ID = os.getenv("INSTAGRAM_DS_USER_ID", "")
+INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME", "")
+INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD", "")
 
 # ============================================================
 # Telegram Bot Token — Render Environment Variable
 # ============================================================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
-# Instagram Base64 encoding table (same as yt-dlp source)
-_ENCODING_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
+# ============================================================
+# instagrapi Client — Auto Login Manager
+# ============================================================
+_ig_client = None
+_ig_lock = threading.Lock()
+
+def get_ig_client():
+    """
+    instagrapi client return karo.
+    Agar logged in nahi hai toh auto-login karo.
+    Thread-safe hai.
+    """
+    global _ig_client
+    with _ig_lock:
+        if _ig_client is not None:
+            return _ig_client
+
+        if not INSTAGRAM_USERNAME or not INSTAGRAM_PASSWORD:
+            logger.warning("⚠️ INSTAGRAM_USERNAME/PASSWORD not set — instagrapi unavailable")
+            return None
+
+        try:
+            from instagrapi import Client
+            from instagrapi.exceptions import LoginRequired, ChallengeRequired
+
+            cl = Client()
+            # Mobile app jaisi settings — detection avoid karti hain
+            cl.set_locale('en_US')
+            cl.set_timezone_offset(19800)  # IST +5:30
+
+            logger.info(f"🔐 Logging into Instagram as {INSTAGRAM_USERNAME}...")
+            cl.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
+            logger.info("✅ instagrapi login successful!")
+            _ig_client = cl
+            return _ig_client
+
+        except Exception as e:
+            logger.error(f"❌ instagrapi login failed: {e}")
+            return None
+
+
+def reset_ig_client():
+    """Session expire hone par client reset karo — next call pe re-login hoga"""
+    global _ig_client
+    with _ig_lock:
+        _ig_client = None
+    logger.info("🔄 instagrapi client reset — will re-login on next request")
 
 
 # ============================================================
-# Helper: Shortcode → Numeric PK (same logic as yt-dlp source)
-# ============================================================
-def shortcode_to_pk(shortcode):
-    """Instagram shortcode ko numeric media PK mein convert karo"""
-    if len(shortcode) > 11:
-        shortcode = shortcode[:11]
-    table = {char: idx for idx, char in enumerate(_ENCODING_CHARS)}
-    result = 0
-    for char in shortcode:
-        if char not in table:
-            raise ValueError(f"Invalid character in shortcode: {char!r}")
-        result = result * 64 + table[char]
-    return result
-
-
-# ============================================================
-# PRIMARY METHOD: Direct Instagram Private API
+# PRIMARY METHOD: instagrapi — Auto Login, No Cookie Headache!
 # Handles: Single Image, Carousel, Video/Reel — ALL types!
 # ============================================================
-def extract_media_from_api_item(media_item):
-    """Instagram API media item se URL extract karo (image ya video)"""
-
-    video_versions = media_item.get('video_versions', [])
-    if video_versions:
-        best = max(
-            (v for v in video_versions if v.get('url')),
-            key=lambda v: (v.get('width', 0) * v.get('height', 0)),
-            default=None
-        )
-        if best:
-            return best['url'], 'video'
-
-    candidates = media_item.get('image_versions2', {}).get('candidates', [])
-    if candidates:
-        best = max(
-            (c for c in candidates if c.get('url')),
-            key=lambda c: (c.get('width', 0) * c.get('height', 0)),
-            default=None
-        )
-        if best:
-            return best['url'], 'image'
-
-    return None, 'image'
-
-
-def fetch_via_instagram_api(shortcode):
+def fetch_via_instagrapi(ig_url):
     """
-    Instagram ke private API se media URLs fetch karo.
-
-    Endpoint: https://i.instagram.com/api/v1/media/{PK}/info/
-    Uses: sessionid + csrftoken cookies for authentication
-    Supports: Single image, Photo carousel, Reel, Video
+    instagrapi se media fetch karo.
+    Auto-login handle karta hai — cookies manually kabhi nahi badlni!
+    Supports: Single image, Carousel, Reel, Video
     """
-    if not all([INSTAGRAM_SESSIONID, INSTAGRAM_DS_USER_ID, INSTAGRAM_CSRFTOKEN]):
-        logger.warning("⚠️ Instagram cookies missing — direct API unavailable")
+    from instagrapi.exceptions import LoginRequired, MediaNotFound, PrivateError
+
+    cl = get_ig_client()
+    if not cl:
         return None
 
     try:
-        pk = shortcode_to_pk(shortcode)
-        logger.info(f"📍 Shortcode '{shortcode}' → PK: {pk}")
-    except ValueError as e:
-        logger.error(f"❌ Shortcode conversion failed: {e}")
+        # URL se media PK nikalo
+        media_pk = cl.media_pk_from_url(ig_url)
+        logger.info(f"📍 instagrapi media PK: {media_pk}")
+
+        media_info = cl.media_info(media_pk)
+        logger.info(f"📦 Media type: {media_info.media_type}, Product type: {media_info.product_type}")
+
+        media_urls = []
+        caption = media_info.caption_text or ''
+
+        # Carousel (album) — multiple images/videos
+        if media_info.media_type == 8:  # GraphSidecar = 8
+            logger.info(f"📚 Carousel: {len(media_info.resources)} items")
+            for resource in media_info.resources:
+                if resource.video_url:
+                    media_urls.append({'type': 'video', 'url': str(resource.video_url)})
+                elif resource.thumbnail_url:
+                    media_urls.append({'type': 'image', 'url': str(resource.thumbnail_url)})
+
+        # Video / Reel
+        elif media_info.media_type == 2:  # Video = 2
+            if media_info.video_url:
+                media_urls.append({'type': 'video', 'url': str(media_info.video_url)})
+
+        # Single Image
+        else:  # Photo = 1
+            if media_info.thumbnail_url:
+                media_urls.append({'type': 'image', 'url': str(media_info.thumbnail_url)})
+
+        logger.info(f"✅ instagrapi: {len(media_urls)} media items found")
+        return {'media_urls': media_urls, 'caption': caption} if media_urls else None
+
+    except LoginRequired:
+        logger.warning("🔄 Session expired — resetting and will retry on next request")
+        reset_ig_client()
+        # Ek baar retry
+        try:
+            cl2 = get_ig_client()
+            if cl2:
+                media_pk = cl2.media_pk_from_url(ig_url)
+                media_info = cl2.media_info(media_pk)
+                media_urls = []
+                caption = media_info.caption_text or ''
+                if media_info.media_type == 8:
+                    for resource in media_info.resources:
+                        if resource.video_url:
+                            media_urls.append({'type': 'video', 'url': str(resource.video_url)})
+                        elif resource.thumbnail_url:
+                            media_urls.append({'type': 'image', 'url': str(resource.thumbnail_url)})
+                elif media_info.media_type == 2:
+                    if media_info.video_url:
+                        media_urls.append({'type': 'video', 'url': str(media_info.video_url)})
+                else:
+                    if media_info.thumbnail_url:
+                        media_urls.append({'type': 'image', 'url': str(media_info.thumbnail_url)})
+                return {'media_urls': media_urls, 'caption': caption} if media_urls else None
+        except Exception as retry_err:
+            logger.error(f"❌ Retry after re-login also failed: {retry_err}")
+            return None
+
+    except PrivateError:
+        logger.warning("🔒 Post is private or inaccessible")
         return None
-
-    session_id = INSTAGRAM_SESSIONID.replace('%3A', ':')
-
-    headers = {
-        'X-IG-App-ID': '936619743392459',
-        'X-ASBD-ID': '198387',
-        'X-IG-WWW-Claim': '0',
-        'Origin': 'https://www.instagram.com',
-        'Referer': f'https://www.instagram.com/p/{shortcode}/',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': '*/*',
-    }
-    cookies = {
-        'sessionid': session_id,
-        'csrftoken': INSTAGRAM_CSRFTOKEN,
-        'ds_user_id': INSTAGRAM_DS_USER_ID,
-    }
-
-    try:
-        resp = requests.get(
-            f'https://i.instagram.com/api/v1/media/{pk}/info/',
-            headers=headers,
-            cookies=cookies,
-            timeout=15
-        )
-        logger.info(f"📡 Instagram API response: {resp.status_code}")
-        resp.raise_for_status()
-        data = resp.json()
-    except requests.exceptions.HTTPError as e:
-        logger.error(f"❌ API HTTP error: {e}")
+    except MediaNotFound:
+        logger.warning("🚫 Media not found")
         return None
     except Exception as e:
-        logger.error(f"❌ API request failed: {e}")
+        logger.error(f"❌ instagrapi fetch failed: {e}")
         return None
-
-    items = data.get('items', [])
-    if not items:
-        logger.error("❌ API returned no items")
-        return None
-
-    item = items[0]
-    media_urls = []
-
-    caption_obj = item.get('caption') or {}
-    caption = caption_obj.get('text', '') if isinstance(caption_obj, dict) else ''
-
-    carousel_media = item.get('carousel_media', [])
-    if carousel_media:
-        logger.info(f"📚 Carousel: {len(carousel_media)} items")
-        for media in carousel_media:
-            url, media_type = extract_media_from_api_item(media)
-            if url:
-                media_urls.append({'type': media_type, 'url': url})
-    else:
-        url, media_type = extract_media_from_api_item(item)
-        if url:
-            media_urls.append({'type': media_type, 'url': url})
-
-    logger.info(f"✅ Direct API: {len(media_urls)} media items found")
-    return {'media_urls': media_urls, 'caption': caption}
 
 
 # ============================================================
-# FALLBACK METHOD: yt-dlp (for edge cases)
+# FALLBACK METHOD: yt-dlp (for edge cases / public posts)
 # ============================================================
-def create_cookie_file():
-    """Netscape format cookie file create karo yt-dlp ke liye"""
-    if not all([INSTAGRAM_SESSIONID, INSTAGRAM_DS_USER_ID, INSTAGRAM_CSRFTOKEN]):
+def create_cookie_file_from_instagrapi():
+    """
+    instagrapi ke active session se cookies nikaalo aur
+    yt-dlp ke liye Netscape format file banao.
+    Manually cookies set karne ki zaroorat NAHI!
+    """
+    cl = get_ig_client()
+    if not cl:
         return None
 
-    sessionid = INSTAGRAM_SESSIONID.replace('%3A', ':')
-    cookie_content = (
-        "# Netscape HTTP Cookie File\n"
-        f".instagram.com\tTRUE\t/\tTRUE\t2099999999\tds_user_id\t{INSTAGRAM_DS_USER_ID}\n"
-        f".instagram.com\tTRUE\t/\tTRUE\t2099999999\tcsrftoken\t{INSTAGRAM_CSRFTOKEN}\n"
-        f".instagram.com\tTRUE\t/\tTRUE\t2099999999\tsessionid\t{sessionid}\n"
-    )
-    tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
-    tmp.write(cookie_content)
-    tmp.close()
-    logger.info(f"🍪 Cookie file: {tmp.name}")
-    return tmp.name
+    try:
+        # instagrapi ke session cookies use karo
+        cookies = cl.cookie_dict
+        if not cookies.get('sessionid'):
+            return None
+
+        cookie_content = "# Netscape HTTP Cookie File\n"
+        for name, value in cookies.items():
+            cookie_content += f".instagram.com\tTRUE\t/\tTRUE\t2099999999\t{name}\t{value}\n"
+
+        tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
+        tmp.write(cookie_content)
+        tmp.close()
+        logger.info(f"🍪 Cookie file from instagrapi session: {tmp.name}")
+        return tmp.name
+    except Exception as e:
+        logger.error(f"❌ Cookie file creation failed: {e}")
+        return None
 
 
 def extract_url_from_entry(entry):
@@ -241,7 +259,7 @@ def fetch_via_ytdlp(url_input):
 
     cookie_file = None
     try:
-        cookie_file = create_cookie_file()
+        cookie_file = create_cookie_file_from_instagrapi()
         if cookie_file:
             ydl_opts['cookiefile'] = cookie_file
 
@@ -366,8 +384,8 @@ def send_instagram_to_telegram(chat_id, ig_url):
     # Processing message
     tg_send_message(chat_id, "⏳ Downloading...")
 
-    # Fetch media
-    result = fetch_via_instagram_api(shortcode)
+    # Fetch media — instagrapi primary, yt-dlp fallback
+    result = fetch_via_instagrapi(ig_url)
     if not result or not result.get('media_urls'):
         result = fetch_via_ytdlp(ig_url)
 
@@ -444,10 +462,11 @@ def get_instagram_data():
 
     result = None
 
-    result = fetch_via_instagram_api(shortcode)
+    # Method 1: instagrapi (auto-login, no cookies needed)
+    result = fetch_via_instagrapi(url_input)
 
     if not result or not result.get('media_urls'):
-        logger.warning("⚠️ Direct API failed — switching to yt-dlp fallback")
+        logger.warning("⚠️ instagrapi failed — switching to yt-dlp fallback")
         result = fetch_via_ytdlp(url_input)
 
     if not result or not result.get('media_urls'):
