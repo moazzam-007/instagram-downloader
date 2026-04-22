@@ -1,8 +1,8 @@
 import os
 import re
+import json as json_module
 import tempfile
 import logging
-import threading
 import requests
 from urllib.parse import urlparse
 from flask import Flask, request, jsonify
@@ -17,11 +17,11 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # ============================================================
-# Instagram Credentials — Render Environment Variables
-# Sirf ek baar set karo, cookies kabhi manually nahi badlni!
+# Instagram Cookies — Render Environment Variables se aate hain
 # ============================================================
-INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME", "")
-INSTAGRAM_PASSWORD = os.getenv("INSTAGRAM_PASSWORD", "")
+INSTAGRAM_SESSIONID  = os.getenv("INSTAGRAM_SESSIONID", "")
+INSTAGRAM_CSRFTOKEN  = os.getenv("INSTAGRAM_CSRFTOKEN", "")
+INSTAGRAM_DS_USER_ID = os.getenv("INSTAGRAM_DS_USER_ID", "")
 
 # ============================================================
 # Telegram Bot Token — Render Environment Variable
@@ -30,173 +30,157 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 # ============================================================
-# instagrapi Client — Auto Login Manager
+# Render API — Cookie Auto-Update ke liye
 # ============================================================
-_ig_client = None
-_ig_lock = threading.Lock()
+RENDER_API_KEY       = os.getenv("RENDER_API_KEY", "")
+RENDER_SERVICE_ID    = os.getenv("RENDER_SERVICE_ID", "")
+COOKIE_UPDATE_SECRET = os.getenv("COOKIE_UPDATE_SECRET", "")
 
-def get_ig_client():
-    """
-    instagrapi client return karo.
-    Agar logged in nahi hai toh auto-login karo.
-    Thread-safe hai.
-    """
-    global _ig_client
-    with _ig_lock:
-        if _ig_client is not None:
-            return _ig_client
-
-        if not INSTAGRAM_USERNAME or not INSTAGRAM_PASSWORD:
-            logger.warning("⚠️ INSTAGRAM_USERNAME/PASSWORD not set — instagrapi unavailable")
-            return None
-
-        try:
-            from instagrapi import Client
-            from instagrapi.exceptions import LoginRequired, ChallengeRequired
-
-            cl = Client()
-            # Mobile app jaisi settings — detection avoid karti hain
-            cl.set_locale('en_US')
-            cl.set_timezone_offset(19800)  # IST +5:30
-
-            logger.info(f"🔐 Logging into Instagram as {INSTAGRAM_USERNAME}...")
-            cl.login(INSTAGRAM_USERNAME, INSTAGRAM_PASSWORD)
-            logger.info("✅ instagrapi login successful!")
-            _ig_client = cl
-            return _ig_client
-
-        except Exception as e:
-            logger.error(f"❌ instagrapi login failed: {e}")
-            return None
-
-
-def reset_ig_client():
-    """Session expire hone par client reset karo — next call pe re-login hoga"""
-    global _ig_client
-    with _ig_lock:
-        _ig_client = None
-    logger.info("🔄 instagrapi client reset — will re-login on next request")
+# Instagram Base64 encoding table (same as yt-dlp source)
+_ENCODING_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
 
 
 # ============================================================
-# PRIMARY METHOD: instagrapi — Auto Login, No Cookie Headache!
-# Handles: Single Image, Carousel, Video/Reel — ALL types!
+# Helper: Shortcode → Numeric PK (same logic as yt-dlp source)
 # ============================================================
-def fetch_via_instagrapi(ig_url):
-    """
-    instagrapi se media fetch karo.
-    Auto-login handle karta hai — cookies manually kabhi nahi badlni!
-    Supports: Single image, Carousel, Reel, Video
-    """
-    from instagrapi.exceptions import LoginRequired, MediaNotFound, PrivateError
+def shortcode_to_pk(shortcode):
+    """Instagram shortcode ko numeric media PK mein convert karo"""
+    if len(shortcode) > 11:
+        shortcode = shortcode[:11]
+    table = {char: idx for idx, char in enumerate(_ENCODING_CHARS)}
+    result = 0
+    for char in shortcode:
+        if char not in table:
+            raise ValueError(f"Invalid character in shortcode: {char!r}")
+        result = result * 64 + table[char]
+    return result
 
-    cl = get_ig_client()
-    if not cl:
+
+# ============================================================
+# PRIMARY METHOD: Direct Instagram Private API
+# ============================================================
+def extract_media_from_api_item(media_item):
+    """Instagram API media item se URL extract karo (image ya video)"""
+    video_versions = media_item.get('video_versions', [])
+    if video_versions:
+        best = max(
+            (v for v in video_versions if v.get('url')),
+            key=lambda v: (v.get('width', 0) * v.get('height', 0)),
+            default=None
+        )
+        if best:
+            return best['url'], 'video'
+
+    candidates = media_item.get('image_versions2', {}).get('candidates', [])
+    if candidates:
+        best = max(
+            (c for c in candidates if c.get('url')),
+            key=lambda c: (c.get('width', 0) * c.get('height', 0)),
+            default=None
+        )
+        if best:
+            return best['url'], 'image'
+
+    return None, 'image'
+
+
+def fetch_via_instagram_api(shortcode):
+    """
+    Instagram ke private API se media URLs fetch karo.
+    Endpoint: https://i.instagram.com/api/v1/media/{PK}/info/
+    """
+    if not all([INSTAGRAM_SESSIONID, INSTAGRAM_DS_USER_ID, INSTAGRAM_CSRFTOKEN]):
+        logger.warning("⚠️ Instagram cookies missing — direct API unavailable")
         return None
 
     try:
-        # URL se media PK nikalo
-        media_pk = cl.media_pk_from_url(ig_url)
-        logger.info(f"📍 instagrapi media PK: {media_pk}")
-
-        media_info = cl.media_info(media_pk)
-        logger.info(f"📦 Media type: {media_info.media_type}, Product type: {media_info.product_type}")
-
-        media_urls = []
-        caption = media_info.caption_text or ''
-
-        # Carousel (album) — multiple images/videos
-        if media_info.media_type == 8:  # GraphSidecar = 8
-            logger.info(f"📚 Carousel: {len(media_info.resources)} items")
-            for resource in media_info.resources:
-                if resource.video_url:
-                    media_urls.append({'type': 'video', 'url': str(resource.video_url)})
-                elif resource.thumbnail_url:
-                    media_urls.append({'type': 'image', 'url': str(resource.thumbnail_url)})
-
-        # Video / Reel
-        elif media_info.media_type == 2:  # Video = 2
-            if media_info.video_url:
-                media_urls.append({'type': 'video', 'url': str(media_info.video_url)})
-
-        # Single Image
-        else:  # Photo = 1
-            if media_info.thumbnail_url:
-                media_urls.append({'type': 'image', 'url': str(media_info.thumbnail_url)})
-
-        logger.info(f"✅ instagrapi: {len(media_urls)} media items found")
-        return {'media_urls': media_urls, 'caption': caption} if media_urls else None
-
-    except LoginRequired:
-        logger.warning("🔄 Session expired — resetting and will retry on next request")
-        reset_ig_client()
-        # Ek baar retry
-        try:
-            cl2 = get_ig_client()
-            if cl2:
-                media_pk = cl2.media_pk_from_url(ig_url)
-                media_info = cl2.media_info(media_pk)
-                media_urls = []
-                caption = media_info.caption_text or ''
-                if media_info.media_type == 8:
-                    for resource in media_info.resources:
-                        if resource.video_url:
-                            media_urls.append({'type': 'video', 'url': str(resource.video_url)})
-                        elif resource.thumbnail_url:
-                            media_urls.append({'type': 'image', 'url': str(resource.thumbnail_url)})
-                elif media_info.media_type == 2:
-                    if media_info.video_url:
-                        media_urls.append({'type': 'video', 'url': str(media_info.video_url)})
-                else:
-                    if media_info.thumbnail_url:
-                        media_urls.append({'type': 'image', 'url': str(media_info.thumbnail_url)})
-                return {'media_urls': media_urls, 'caption': caption} if media_urls else None
-        except Exception as retry_err:
-            logger.error(f"❌ Retry after re-login also failed: {retry_err}")
-            return None
-
-    except PrivateError:
-        logger.warning("🔒 Post is private or inaccessible")
-        return None
-    except MediaNotFound:
-        logger.warning("🚫 Media not found")
-        return None
-    except Exception as e:
-        logger.error(f"❌ instagrapi fetch failed: {e}")
+        pk = shortcode_to_pk(shortcode)
+        logger.info(f"📍 Shortcode '{shortcode}' → PK: {pk}")
+    except ValueError as e:
+        logger.error(f"❌ Shortcode conversion failed: {e}")
         return None
 
+    session_id = INSTAGRAM_SESSIONID.replace('%3A', ':')
 
-# ============================================================
-# FALLBACK METHOD: yt-dlp (for edge cases / public posts)
-# ============================================================
-def create_cookie_file_from_instagrapi():
-    """
-    instagrapi ke active session se cookies nikaalo aur
-    yt-dlp ke liye Netscape format file banao.
-    Manually cookies set karne ki zaroorat NAHI!
-    """
-    cl = get_ig_client()
-    if not cl:
-        return None
+    headers = {
+        'X-IG-App-ID': '936619743392459',
+        'X-ASBD-ID': '198387',
+        'X-IG-WWW-Claim': '0',
+        'Origin': 'https://www.instagram.com',
+        'Referer': f'https://www.instagram.com/p/{shortcode}/',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': '*/*',
+    }
+    cookies = {
+        'sessionid': session_id,
+        'csrftoken': INSTAGRAM_CSRFTOKEN,
+        'ds_user_id': INSTAGRAM_DS_USER_ID,
+    }
 
     try:
-        # instagrapi ke session cookies use karo
-        cookies = cl.cookie_dict
-        if not cookies.get('sessionid'):
-            return None
-
-        cookie_content = "# Netscape HTTP Cookie File\n"
-        for name, value in cookies.items():
-            cookie_content += f".instagram.com\tTRUE\t/\tTRUE\t2099999999\t{name}\t{value}\n"
-
-        tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
-        tmp.write(cookie_content)
-        tmp.close()
-        logger.info(f"🍪 Cookie file from instagrapi session: {tmp.name}")
-        return tmp.name
-    except Exception as e:
-        logger.error(f"❌ Cookie file creation failed: {e}")
+        resp = requests.get(
+            f'https://i.instagram.com/api/v1/media/{pk}/info/',
+            headers=headers,
+            cookies=cookies,
+            timeout=15
+        )
+        logger.info(f"📡 Instagram API response: {resp.status_code}")
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"❌ API HTTP error: {e}")
         return None
+    except Exception as e:
+        logger.error(f"❌ API request failed: {e}")
+        return None
+
+    items = data.get('items', [])
+    if not items:
+        logger.error("❌ API returned no items")
+        return None
+
+    item = items[0]
+    media_urls = []
+
+    caption_obj = item.get('caption') or {}
+    caption = caption_obj.get('text', '') if isinstance(caption_obj, dict) else ''
+
+    carousel_media = item.get('carousel_media', [])
+    if carousel_media:
+        logger.info(f"📚 Carousel: {len(carousel_media)} items")
+        for media in carousel_media:
+            url, media_type = extract_media_from_api_item(media)
+            if url:
+                media_urls.append({'type': media_type, 'url': url})
+    else:
+        url, media_type = extract_media_from_api_item(item)
+        if url:
+            media_urls.append({'type': media_type, 'url': url})
+
+    logger.info(f"✅ Direct API: {len(media_urls)} media items found")
+    return {'media_urls': media_urls, 'caption': caption}
+
+
+# ============================================================
+# FALLBACK METHOD: yt-dlp
+# ============================================================
+def create_cookie_file():
+    """Netscape format cookie file create karo yt-dlp ke liye"""
+    if not all([INSTAGRAM_SESSIONID, INSTAGRAM_DS_USER_ID, INSTAGRAM_CSRFTOKEN]):
+        return None
+
+    sessionid = INSTAGRAM_SESSIONID.replace('%3A', ':')
+    cookie_content = (
+        "# Netscape HTTP Cookie File\n"
+        f".instagram.com\tTRUE\t/\tTRUE\t2099999999\tds_user_id\t{INSTAGRAM_DS_USER_ID}\n"
+        f".instagram.com\tTRUE\t/\tTRUE\t2099999999\tcsrftoken\t{INSTAGRAM_CSRFTOKEN}\n"
+        f".instagram.com\tTRUE\t/\tTRUE\t2099999999\tsessionid\t{sessionid}\n"
+    )
+    tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False)
+    tmp.write(cookie_content)
+    tmp.close()
+    logger.info(f"🍪 Cookie file: {tmp.name}")
+    return tmp.name
 
 
 def extract_url_from_entry(entry):
@@ -259,7 +243,7 @@ def fetch_via_ytdlp(url_input):
 
     cookie_file = None
     try:
-        cookie_file = create_cookie_file_from_instagrapi()
+        cookie_file = create_cookie_file()
         if cookie_file:
             ydl_opts['cookiefile'] = cookie_file
 
@@ -300,7 +284,6 @@ def fetch_via_ytdlp(url_input):
 # Telegram Helper Functions
 # ============================================================
 def tg_send_message(chat_id, text, parse_mode="HTML"):
-    """Telegram mein plain text message bhejo"""
     try:
         requests.post(
             f"{TELEGRAM_API}/sendMessage",
@@ -312,7 +295,6 @@ def tg_send_message(chat_id, text, parse_mode="HTML"):
 
 
 def tg_send_photo(chat_id, url, caption=""):
-    """Telegram mein single photo bhejo URL se"""
     try:
         resp = requests.post(
             f"{TELEGRAM_API}/sendPhoto",
@@ -326,7 +308,6 @@ def tg_send_photo(chat_id, url, caption=""):
 
 
 def tg_send_video(chat_id, url, caption=""):
-    """Telegram mein single video bhejo URL se"""
     try:
         resp = requests.post(
             f"{TELEGRAM_API}/sendVideo",
@@ -340,10 +321,6 @@ def tg_send_video(chat_id, url, caption=""):
 
 
 def tg_send_media_group(chat_id, media_items, caption=""):
-    """
-    Telegram mein carousel/album bhejo (max 10 items).
-    caption sirf pehle item pe lagti hai.
-    """
     media_group = []
     for i, item in enumerate(media_items[:10]):
         entry = {
@@ -351,7 +328,7 @@ def tg_send_media_group(chat_id, media_items, caption=""):
             "media": item['url'],
         }
         if i == 0 and caption:
-            entry["caption"] = caption[:1024]  # Telegram caption limit
+            entry["caption"] = caption[:1024]
         media_group.append(entry)
 
     try:
@@ -367,12 +344,6 @@ def tg_send_media_group(chat_id, media_items, caption=""):
 
 
 def send_instagram_to_telegram(chat_id, ig_url):
-    """
-    Instagram URL se media fetch karke Telegram pe bhejo.
-    Single image/video → direct send
-    Carousel → media group (album)
-    """
-    # Shortcode extract
     sc_match = re.search(r'/(?:p|reel|tv|reels)/([^/?#&]+)', ig_url)
     if not sc_match:
         tg_send_message(chat_id, "❌ Ye valid Instagram post URL nahi lagti.\n\nFormat: <code>https://www.instagram.com/p/XXXX/</code>")
@@ -380,12 +351,9 @@ def send_instagram_to_telegram(chat_id, ig_url):
 
     shortcode = sc_match.group(1)
     logger.info(f"📥 Telegram request | Shortcode: {shortcode}")
-
-    # Processing message
     tg_send_message(chat_id, "⏳ Downloading...")
 
-    # Fetch media — instagrapi primary, yt-dlp fallback
-    result = fetch_via_instagrapi(ig_url)
+    result = fetch_via_instagram_api(shortcode)
     if not result or not result.get('media_urls'):
         result = fetch_via_ytdlp(ig_url)
 
@@ -395,7 +363,6 @@ def send_instagram_to_telegram(chat_id, ig_url):
 
     media_urls = result['media_urls']
     caption = (result.get('caption', '') or '')[:1024]
-
     count = len(media_urls)
     logger.info(f"📤 Sending {count} item(s) to Telegram chat {chat_id}")
 
@@ -408,18 +375,17 @@ def send_instagram_to_telegram(chat_id, ig_url):
         if not ok:
             tg_send_message(chat_id, "⚠️ Media send nahi hua. URL expire ho sakti hai, dobara try karo.")
     else:
-        # Carousel — album as media group
         ok = tg_send_media_group(chat_id, media_urls, caption)
         if not ok:
             tg_send_message(chat_id, f"⚠️ Album send nahi hua ({count} items). Dobara try karo.")
 
 
 # ============================================================
-# Flask Routes — Existing (unchanged)
+# Flask Routes
 # ============================================================
 @app.route('/')
 def home():
-    return "📸 Instagram Downloader v3.0 — Direct API + yt-dlp fallback. All types supported!"
+    return "📸 Instagram Downloader v3.1 — Direct API + yt-dlp fallback + Auto Cookie Update!"
 
 
 @app.route('/health')
@@ -429,18 +395,6 @@ def health():
 
 @app.route('/instagram', methods=['GET'])
 def get_instagram_data():
-    """
-    GET /instagram?url=https://www.instagram.com/p/SHORTCODE/
-
-    Supports ALL Instagram post types:
-    ✅ Single image
-    ✅ Photo carousel (multiple images)
-    ✅ Reel / Video
-    ✅ Mixed carousel (image + video)
-
-    Method 1 (Primary):  Direct Instagram Private API — fast & reliable
-    Method 2 (Fallback): yt-dlp — handles edge cases
-    """
     url_input = request.args.get('url', '').strip()
 
     if not url_input:
@@ -460,13 +414,10 @@ def get_instagram_data():
     shortcode = sc_match.group(1)
     logger.info(f"📥 Request: {url_input} | Shortcode: {shortcode}")
 
-    result = None
-
-    # Method 1: instagrapi (auto-login, no cookies needed)
-    result = fetch_via_instagrapi(url_input)
+    result = fetch_via_instagram_api(shortcode)
 
     if not result or not result.get('media_urls'):
-        logger.warning("⚠️ instagrapi failed — switching to yt-dlp fallback")
+        logger.warning("⚠️ Direct API failed — switching to yt-dlp fallback")
         result = fetch_via_ytdlp(url_input)
 
     if not result or not result.get('media_urls'):
@@ -488,22 +439,120 @@ def get_instagram_data():
 
 
 # ============================================================
-# Flask Routes — Telegram Webhook (NEW)
+# NEW: Cookie Auto-Update Endpoint
+# POST /update-cookies
+# Header: X-Secret: <COOKIE_UPDATE_SECRET>
+# Body: Cookie-Editor se copy kiya hua poora JSON array
+# ============================================================
+@app.route('/update-cookies', methods=['POST'])
+def update_cookies():
+    # 1. Secret check
+    secret = request.headers.get("X-Secret", "") or request.args.get("secret", "")
+    if not COOKIE_UPDATE_SECRET or secret != COOKIE_UPDATE_SECRET:
+        logger.warning("❌ /update-cookies — unauthorized attempt")
+        return jsonify({"success": False, "error": "Unauthorized"}), 401
+
+    # 2. Render config check
+    if not RENDER_API_KEY or not RENDER_SERVICE_ID:
+        return jsonify({"success": False, "error": "RENDER_API_KEY ya RENDER_SERVICE_ID env mein missing hai"}), 500
+
+    # 3. JSON parse
+    try:
+        cookies_raw = request.get_json(force=True)
+        if isinstance(cookies_raw, str):
+            cookies_raw = json_module.loads(cookies_raw)
+        if not isinstance(cookies_raw, list):
+            return jsonify({"success": False, "error": "JSON array expected"}), 400
+    except Exception as e:
+        return jsonify({"success": False, "error": f"Invalid JSON: {e}"}), 400
+
+    # 4. 3 zaroori cookies extract karo
+    extracted = {}
+    for c in cookies_raw:
+        name = c.get("name", "")
+        value = c.get("value", "")
+        if name == "sessionid" and value:
+            extracted["INSTAGRAM_SESSIONID"] = value
+        elif name == "csrftoken" and value:
+            extracted["INSTAGRAM_CSRFTOKEN"] = value
+        elif name == "ds_user_id" and value:
+            extracted["INSTAGRAM_DS_USER_ID"] = value
+
+    missing = [k for k in ["INSTAGRAM_SESSIONID", "INSTAGRAM_CSRFTOKEN", "INSTAGRAM_DS_USER_ID"] if k not in extracted]
+    if missing:
+        return jsonify({"success": False, "error": f"Ye cookies JSON mein nahi mili: {missing}"}), 400
+
+    logger.info(f"🍪 Cookies extracted: {list(extracted.keys())}")
+
+    render_headers = {
+        "Authorization": f"Bearer {RENDER_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    # 5. Existing env vars fetch karo Render se
+    env_resp = requests.get(
+        f"https://api.render.com/v1/services/{RENDER_SERVICE_ID}/env-vars",
+        headers=render_headers,
+        timeout=10
+    )
+    if not env_resp.ok:
+        logger.error(f"❌ Render env fetch failed: {env_resp.status_code} {env_resp.text}")
+        return jsonify({"success": False, "error": f"Render env fetch failed: {env_resp.status_code}"}), 500
+
+    existing_env = env_resp.json()  # [{"key": "...", "value": "..."}, ...]
+
+    # 6. Sirf 3 Instagram cookie values update karo, baaki sab same rakho
+    updated_keys = []
+    for item in existing_env:
+        if item["key"] in extracted:
+            item["value"] = extracted[item["key"]]
+            updated_keys.append(item["key"])
+
+    # Agar koi key exist hi nahi karti toh add karo
+    for key, value in extracted.items():
+        if key not in updated_keys:
+            existing_env.append({"key": key, "value": value})
+            updated_keys.append(key)
+
+    # 7. PUT — full env vars list wapas bhejo
+    put_resp = requests.put(
+        f"https://api.render.com/v1/services/{RENDER_SERVICE_ID}/env-vars",
+        headers=render_headers,
+        json=existing_env,
+        timeout=10
+    )
+    if not put_resp.ok:
+        logger.error(f"❌ Render env update failed: {put_resp.status_code} {put_resp.text}")
+        return jsonify({"success": False, "error": f"Render env update failed: {put_resp.status_code}"}), 500
+
+    logger.info(f"✅ Env vars updated: {updated_keys}")
+
+    # 8. Redeploy trigger
+    deploy_resp = requests.post(
+        f"https://api.render.com/v1/services/{RENDER_SERVICE_ID}/deploys",
+        headers=render_headers,
+        json={"clearCache": "do_not_clear"},
+        timeout=10
+    )
+    deploy_ok = deploy_resp.ok
+    logger.info(f"🚀 Redeploy triggered: {deploy_ok} | Status: {deploy_resp.status_code}")
+
+    return jsonify({
+        "success": True,
+        "message": "✅ Cookies update ho gayi! Service redeploying... ~1-2 min mein ready ho jayega.",
+        "updated_keys": updated_keys,
+        "deploy_triggered": deploy_ok
+    })
+
+
+# ============================================================
+# Telegram Webhook
 # ============================================================
 @app.route('/telegram', methods=['POST'])
 def telegram_webhook():
-    """
-    POST /telegram
-    Telegram webhook — bot messages yahan receive hote hain.
-    Render pe set karo:  https://YOUR-RENDER-URL/telegram
-
-    Supported commands:
-      /start  → Welcome message + usage guide
-      Instagram URL → Media download karke Telegram pe bhejo
-    """
     if not TELEGRAM_BOT_TOKEN:
         logger.error("❌ TELEGRAM_BOT_TOKEN not set")
-        return jsonify({"ok": False}), 200  # 200 return karo warna Telegram retry karega
+        return jsonify({"ok": False}), 200
 
     try:
         data = request.get_json(force=True)
@@ -512,7 +561,7 @@ def telegram_webhook():
 
     message = data.get('message') or data.get('edited_message')
     if not message:
-        return jsonify({"ok": True}), 200  # callback_query etc. ignore karo
+        return jsonify({"ok": True}), 200
 
     chat_id = message.get('chat', {}).get('id')
     text = (message.get('text') or '').strip()
@@ -522,7 +571,6 @@ def telegram_webhook():
 
     logger.info(f"💬 Telegram message from {chat_id}: {text[:80]}")
 
-    # /start command
     if text.startswith('/start'):
         welcome = (
             "👋 <b>Assalamu Alaikum! Instagram Downloader Bot mein aapka swagat hai.</b>\n\n"
@@ -536,14 +584,12 @@ def telegram_webhook():
             "📋 <b>Format:</b>\n"
             "<code>https://www.instagram.com/p/XXXXXXX/</code>\n"
             "<code>https://www.instagram.com/reel/XXXXXXX/</code>\n\n"
-            "⚠️ <b>Note:</b> Sirf public posts ka kaam karega. Private posts ke liye valid cookies zaroori hain."
+            "⚠️ <b>Note:</b> Sirf public posts ka kaam karega."
         )
         tg_send_message(chat_id, welcome)
         return jsonify({"ok": True}), 200
 
-    # Instagram URL check
     if 'instagram.com' in text:
-        # URL extract karo message se (user ne extra text bhi likha ho sakta hai)
         url_match = re.search(r'https?://(?:www\.)?instagram\.com/[^\s]+', text)
         if url_match:
             ig_url = url_match.group(0)
@@ -552,7 +598,6 @@ def telegram_webhook():
             tg_send_message(chat_id, "❌ Instagram URL theek se nahi mili. Poora link paste karo.")
         return jsonify({"ok": True}), 200
 
-    # Unknown message
     tg_send_message(
         chat_id,
         "❓ Samajh nahi aaya.\n\nInstagram post/reel ka link bhejo, main media download karke dunga.\n\nExample:\n<code>https://www.instagram.com/p/XXXXXXX/</code>"
@@ -561,20 +606,16 @@ def telegram_webhook():
 
 
 # ============================================================
-# Webhook Register Helper Route (one-time use)
+# Webhook Register Helper (one-time use)
 # ============================================================
 @app.route('/setup-webhook', methods=['GET'])
 def setup_webhook():
-    """
-    GET /setup-webhook?url=https://YOUR-RENDER-URL
-    Ek baar call karo — Telegram webhook register ho jaayega.
-    """
     if not TELEGRAM_BOT_TOKEN:
         return jsonify({"success": False, "error": "TELEGRAM_BOT_TOKEN not set"}), 400
 
     base_url = request.args.get('url', '').strip().rstrip('/')
     if not base_url:
-        return jsonify({"success": False, "error": "url parameter required. Example: /setup-webhook?url=https://your-app.onrender.com"}), 400
+        return jsonify({"success": False, "error": "url parameter required"}), 400
 
     webhook_url = f"{base_url}/telegram"
     try:
